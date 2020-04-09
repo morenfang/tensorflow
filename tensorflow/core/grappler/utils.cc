@@ -125,7 +125,9 @@ void NodeMap::AddOutput(const string& node_name, const string& output_name) {
   auto output_node = nodes_[NodeName(output_name)];
   CHECK(output_node) << "Output node " << output_name
                      << " is missing in NodeMap.";
+  VLOG(2) << node_name << " AddOutput Fetch: " << output_node->name() << ":" << output_name;
   outputs_[node_name].insert(output_node);
+  VLOG(2) << "insert success.";
 }
 
 void NodeMap::RemoveOutput(const string& node_name, const string& output_name) {

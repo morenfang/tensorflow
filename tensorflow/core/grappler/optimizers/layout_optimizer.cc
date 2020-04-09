@@ -2199,6 +2199,7 @@ Status LayoutOptimizer::Tune(const GrapplerItem& item,
 
 Status LayoutOptimizer::Optimize(Cluster* cluster, const GrapplerItem& item,
                                  GraphDef* output) {
+  VLOG(2) << "Layout_optimizer Entering.";
   if (cluster == nullptr) {
     LOG(WARNING) << "layout optimizer was called with cluster == nullptr";
     return errors::Aborted("cluster == nullptr.");

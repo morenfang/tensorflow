@@ -49,6 +49,7 @@ limitations under the License.
 #include "tensorflow/core/lib/strings/str_util.h"
 #include "tensorflow/core/lib/strings/strcat.h"
 #include "tensorflow/core/platform/tensor_coding.h"
+#include "tensorflow/core/util/dump_graph.h"
 #include "tensorflow/core/util/device_name_utils.h"
 #include "tensorflow/core/util/saved_tensor_slice_util.h"
 #include "tensorflow/core/util/strided_slice_op.h"
@@ -687,7 +688,9 @@ class HoistCommonFactorOutOfAggregation : public ArithmeticOptimizerStage {
 
   Status TrySimplify(NodeDef* node, string* simplified_node_name) override {
     TF_RETURN_IF_ERROR(EnsureNodeIsSupported(node));
-
+    VLOG(2) << "HoistCommonFactorOutOfAggregation::TrySimplify Entering";
+    VLOG(2) << "Node name: " << node->name() 
+            << ".  simplified_node_name: " << *simplified_node_name; 
     bool common_factor_is_denominator = false;
     std::set<string> common_factors;
     std::vector<string> ctrl_deps;
@@ -741,11 +744,14 @@ class HoistCommonFactorOutOfAggregation : public ArithmeticOptimizerStage {
 
         // optimize new inner aggregation node
         AddToOptimizationQueue(new_add_node);
+        VLOG(2) << "new_add_node: " << new_add_node->name();
+        VLOG(2) << "new_outer_node: " << new_outer_node->name();
         // do not optimize the same node twice
         rewritten_nodes_.insert(node->name());
         *simplified_node_name = new_outer_node->name();
       }
     }
+    
     return Status::OK();
   }
 
@@ -1382,6 +1388,495 @@ class RemoveLogicalNotStage : public ArithmeticOptimizerStage {
   }
 };
 
+
+class HoistConcatChainsStage : public ArithmeticOptimizerStage {
+ public:
+  explicit HoistConcatChainsStage(const GraphOptimizerContext& ctx,
+                                      const ArithmeticOptimizerContext& ctx_ext)
+      : ArithmeticOptimizerStage("HoistConcatChainsStage", ctx, ctx_ext) {}
+
+  ~HoistConcatChainsStage() override = default;
+
+  struct ChainLink {
+    ChainLink() = default;
+    ChainLink(NodeDef* _node, int _port_origin)
+        : node(_node), port_origin(_port_origin) {}
+    NodeDef* node;    // Node in a chain.
+    int port_origin;  // Port on concat/split node from which this chain
+                      // originates.
+
+    bool operator<(const ChainLink& other) const {
+      if (port_origin < other.port_origin) {
+        return true;
+      } else if (port_origin > other.port_origin) {
+        return false;
+      } else {
+        return node->name() < other.node->name();
+      }
+    }
+  };
+
+  // We use an ordinary set sorted on port and node name, so the order, and
+  // hence the node name used for the hoisted chain, will be deterministic.
+  using ChainLinkSet = std::set<ChainLink>;
+
+  bool IsSupported(const NodeDef* node) const override {
+    if (IsInPreserveSet(*node)) return false;
+    if (IsConcat(*node) && node->attr().count("N") != 0) {
+      const int n = node->attr().at("N").i();
+      return n > 1;
+    } else {
+      return false;
+    }
+  }
+
+  Status TrySimplify(NodeDef* node, string* simplified_node_name) override {
+    VLOG(2) << "HoistConcatChainsStage Entering.";
+    // node_is_concat_ = IsConcat(*node);
+    int prefix_length;
+    std::set<string> ctrl_inputs;
+    ChainLinkSet tails;
+    TF_RETURN_IF_ERROR(
+        FindCommonOpChain(*node, &prefix_length, &tails, &ctrl_inputs));
+    VLOG(2) << "tail node: ";
+    for (auto &node : tails) {
+      VLOG(2) << "  " << node.node->name();
+    }
+    VLOG(2) << "prefix_length: " << prefix_length;
+    VLOG(2) << "ctrl_inputs: ";
+    for (auto node : ctrl_inputs) {
+      VLOG(2) << "  " << node;
+    }
+    VLOG(2) << "Dump Prepare Hoist: ";
+    if (VLOG_IS_ON(2)) {
+      DumpGraphDefToFile(
+        strings::StrCat("prepare_hoist_concat_",
+                        reinterpret_cast<uintptr_t>(ctx().optimized_graph)),
+        *(ctx().optimized_graph));
+    }
+    if (prefix_length > 0 && !tails.empty()) {
+      TF_RETURN_IF_ERROR(
+          HoistOpChain(prefix_length, tails, &ctrl_inputs, node));
+    }
+    VLOG(2) << "Dump After Hoist: ";
+    if (VLOG_IS_ON(2)) {
+      DumpGraphDefToFile(
+        strings::StrCat("after_hoist_concat_",
+                        reinterpret_cast<uintptr_t>(ctx().optimized_graph)),
+        *(ctx().optimized_graph));
+    }
+    return Status::OK();
+  }
+
+ private:
+  // Returns the length of the common unary chain of ops that can be
+  // hoisted to the other side of concat or split.
+  Status FindCommonOpChain(const NodeDef& root_node, int* prefix_length,
+                           ChainLinkSet* tails,
+                           std::set<string>* ctrl_inputs) const {
+    *prefix_length = 0;
+    // Follow the chains starting at each concat input or split output as long
+    // as all the following conditions hold:
+    //   1. The ops in all chains are the same.
+    //   2. The ops are unary elemenwise op.
+    //   3. The op output has only a single consumer (concat only).
+    ChainLinkSet cur_tails;
+    TF_RETURN_IF_ERROR(InitializeChains(root_node, &cur_tails));
+    if (cur_tails.size() < 2) {
+      return Status::OK();
+    }
+    ctrl_inputs->clear();
+    bool stop = false;
+    while (!stop && !cur_tails.empty() &&
+           OpsAreSafeToHoist(root_node, cur_tails)) {
+      // We found one more link that can be hoisted.
+      ++(*prefix_length);
+      tails->swap(cur_tails);
+      GatherControlInputs(ctrl_inputs, *tails);
+
+      // Advance tail pointers to the next level.
+      TF_RETURN_IF_ERROR(AdvanceTails(*tails, &cur_tails, &stop));
+    }
+    return Status::OK();
+  }
+
+  // Hoists the chains to the other side of concat or split and attaches the
+  // control inputs gathered from them to the concat or split node.
+  Status HoistOpChain(const int prefix_length, const ChainLinkSet& tails,
+                      std::set<string>* ctrl_inputs, NodeDef* root_node) {
+    if (tails.empty()) {
+      return Status::OK();
+    }
+    AddToOptimizationQueue(root_node);
+    optimized_nodes_.insert(root_node->name());
+    AddControlInputs(ctrl_inputs, root_node);
+    return HoistChainForConcat(prefix_length, tails, root_node);
+  }
+
+  void GatherControlInputs(std::set<string>* ctrl_inputs,
+                           const ChainLinkSet& ops) const {
+    for (const auto& link : ops) {
+      const NodeDef* node = link.node;
+      for (int i = node->input_size() - 1; i >= 0; --i) {
+        const string& input = node->input(i);
+        VLOG(2) << "GatherControlInputs: " << input;
+        if (!IsControlInput(input)) break;
+        ctrl_inputs->insert(input);
+      }
+    }
+  }
+
+  void AddControlInputs(std::set<string>* new_ctrl_inputs,
+                        NodeDef* node) const {
+    for (int i = node->input_size() - 1; i >= 0; --i) {
+      const string& existing_input = node->input(i);
+      if (!IsControlInput(existing_input)) break;
+      new_ctrl_inputs->erase(existing_input);
+    }
+    for (const string& new_input : *new_ctrl_inputs) {
+      ctx().node_map->AddOutput(NodeName(new_input), node->name());
+      node->add_input(new_input);
+    }
+  }
+
+  Status InitializeChains(const NodeDef& node, ChainLinkSet* tails) const {
+    // Handle concat nodes by looking backwards in the graph.
+    TF_RETURN_IF_ERROR(CheckAttrExists(node, "N"));
+    const int n = node.attr().at("N").i();
+    const int start = node.op() == "Concat" ? 1 : 0;
+    const int end = start + n;
+    // Set up tail pointers to point to the immediate inputs to Concat.
+    for (int input_port = start; input_port < end; ++input_port) {
+      if (IsControlInput(node.input(input_port))) {
+        return errors::FailedPrecondition(
+            "Got control input ", node.input(input_port),
+            " where normal input was expected.");
+      }
+      NodeDef* tail;
+      TF_RETURN_IF_ERROR(GetInputNode(node.input(input_port), &tail));
+      tails->insert(ChainLink(tail, input_port));
+    }
+    return Status::OK();
+  }
+
+  bool OpsAreSafeToHoist(const NodeDef& root_node,
+                         const ChainLinkSet& ops) const {
+    VLOG(2) << "root: " << root_node.name();
+    int relu_count = 0;
+    for (const auto& link : ops) {
+      const NodeDef* op = link.node;
+      VLOG(2) << "OpsAreSafeToHoist cur_tails: " << op->name();
+    }
+    if (ops.empty()) return true;
+    const NodeDef* op0 = ops.begin()->node;
+    // TODO: Add or Mul, and have the same w or b.
+    if (ModifiesFrameInfo(*op0) || 
+         (!IsUnaryElementWise(*op0) 
+          && !IsAdd(*op0) 
+          && !IsMatMul(*op0))) return false;
+    for (const auto& link : ops) {
+      const NodeDef* op = link.node;
+      if (op->device() != root_node.device() || op->op() != op0->op() ||
+          IsInPreserveSet(*op)) {
+        VLOG(2) << "device or op NOT same. Or Preserved.";
+        return false;
+      }
+      if (ctx().node_map->GetOutputs(op->name()).size() > 1 &&
+          IsRelu(*op)) { 
+        // now just support Relu.
+        // TODO(moren): support other UnaryElementWise op.
+        VLOG(2) << "this op should be process: " << op->name();
+        relu_count++;
+        // return false;
+      }
+    }
+    for (const auto& link : ops) {
+      // matmul to batch_matmul
+      NodeDef* op = link.node;
+      if (IsMatMul(*op0)) {
+        op->set_op("BatchMatMulV2");
+        auto attr = op->mutable_attr();
+        SetAttrValue(false, &(*attr)["adj_x"]);
+        SetAttrValue(false, &(*attr)["adj_y"]);
+        attr->erase("transpose_a");
+        attr->erase("transpose_b");
+      }
+    }
+    if (relu_count == ops.size()) {
+      // all is relu.
+      // add new relu
+      NodeDef *new_relu = ctx().optimized_graph->add_node();
+      new_relu->set_name(AddPrefixToNodeName("relu_all", op0->input(0)));
+      new_relu->set_op("Relu");
+      new_relu->add_input(op0->input(0));
+      new_relu->set_device(root_node.device());
+      auto attr = new_relu->mutable_attr();
+      SetAttrValue(root_node.attr().at("T").type(), &(*attr)["T"]);
+      ctx().node_map->AddNode(new_relu->name(), new_relu);
+      ctx().node_map->AddOutput(op0->input(0), new_relu->name());
+
+      // reshape
+      NodeDef* new_reshape_shape = ctx().optimized_graph->add_node();
+      new_reshape_shape->set_name(AddPrefixToNodeName("relu_reshape/shape", op0->input(0)));
+      new_reshape_shape->set_op("Const");
+      new_reshape_shape->set_device(root_node.device());
+      TensorProto tensor0;
+      tensor0.set_dtype(DT_INT32);
+      tensor0.mutable_tensor_shape()->add_dim()->set_size(2);
+      VLOG(2) << "Test Mark. ";
+      int var = ctx().graph_properties->GetOutputProperties(op0->name())[0].shape().dim(1).size();
+      VLOG(2) << "Relu_all output dim 2 shape: " << var;
+      tensor0.add_int_val(16);
+      tensor0.add_int_val(relu_count * var);
+      attr = new_reshape_shape->mutable_attr();
+      SetAttrValue(DT_INT32, &(*attr)["dtype"]);
+      SetAttrValue(tensor0, &(*attr)["value"]);
+      ctx().node_map->AddNode(new_reshape_shape->name(), new_reshape_shape);
+
+      NodeDef* new_reshape = ctx().optimized_graph->add_node();
+      new_reshape->set_name(AddPrefixToNodeName("relu_reshape", op0->input(0)));
+      new_reshape->set_op("Reshape");
+      new_reshape->set_device(root_node.device());
+      new_reshape->add_input(new_relu->name());
+      new_reshape->add_input(new_reshape_shape->name());
+      attr = new_reshape->mutable_attr();
+      SetAttrValue(root_node.attr().at("T").type(), &(*attr)["T"]);
+      SetAttrValue(DT_INT32, &(*attr)["Tshape"]);
+      ctx().node_map->AddNode(new_reshape->name(), new_reshape);
+      ctx().node_map->AddOutput(new_relu->name(), new_reshape->name());
+      ctx().node_map->AddOutput(new_reshape_shape->name(), new_reshape->name());
+
+      // add split to relu.
+      NodeDef *new_split_dim = ctx().optimized_graph->add_node();
+      new_split_dim->set_name(AddPrefixToNodeName("split/split_dim", op0->input(0)));
+      new_split_dim->set_op("Const");
+      new_split_dim->set_device(root_node.device());
+      TensorProto tensor;
+      tensor.set_dtype(DT_INT32);
+      TensorShapeProto shape;
+      *tensor.mutable_tensor_shape() = shape;
+      tensor.add_int_val(1);
+      attr = new_split_dim->mutable_attr();
+      SetAttrValue(DT_INT32, &(*attr)["dtype"]);
+      SetAttrValue(tensor, &(*attr)["value"]);
+      ctx().node_map->AddNode(new_split_dim->name(), new_split_dim);
+
+      NodeDef *new_split = ctx().optimized_graph->add_node();
+      new_split->set_name(AddPrefixToNodeName("split", op0->input(0)));
+      new_split->set_op("Split");
+      new_split->add_input(new_split_dim->name());
+      new_split->add_input(new_reshape->name());
+      new_split->set_device(root_node.device());
+      attr = new_split->mutable_attr();
+      SetAttrValue(root_node.attr().at("T").type(), &(*attr)["T"]);
+      SetAttrValue(relu_count, &(*attr)["num_split"]);
+      ctx().node_map->AddNode(new_split->name(), new_split);
+      ctx().node_map->AddOutput(new_split_dim->name(), new_split->name());
+      ctx().node_map->AddOutput(new_reshape->name(), new_split->name());
+
+      // ctx().node_map->AddNode(composition_node->name(), composition_node);
+      // ctx().node_map->AddOutput(NodeName(last_op->input(0)),
+      //                           composition_node->name());
+      
+      int i = 0;
+      for (const auto& link : ops) {
+        NodeDef* op = link.node;
+        string index = ":" + std::to_string(i);
+        string split_input;
+        if (i == 0) {
+          // op->set_input(0, new_split->name());
+          split_input = new_split->name();
+        } else {
+          // op->set_input(0, strings::StrCat(new_split->name(), index));
+          split_input = strings::StrCat(new_split->name(), index);
+        }
+        VLOG(2) << "----------------------------";
+        std::set<NodeDef*> outputs = ctx().node_map->GetOutputs(op->name());
+        for (NodeDef* output : outputs) {
+          VLOG(2) << op->name() << "'s output node: " << output->name();
+          if ((int)(output->name().find("gradients")) >= 0) {
+            VLOG(2) << op->name() << " to " << split_input;
+            for (int port = 0; port < output->input_size(); port++) {
+              if (output->input(port) == op->name()) {
+                output->set_input(port, split_input);
+                break;
+              }
+            }
+            // output->set_input(j, split_input);
+            ctx().node_map->UpdateInput(output->name(), op->name(), split_input);
+          } else {
+            VLOG(2) << op->name()
+                    << " to op(relu) " << new_relu->name();
+            for (int port = 0; port < output->input_size(); port++) {
+              if (output->input(port) == op->name()) {
+                output->set_input(port, new_relu->name());
+                break;
+              }
+            }
+            // output->set_input(j, new_relu->name());
+            ctx().node_map->UpdateInput(output->name(), op->name(), new_relu->name());
+          }
+        }
+        VLOG(2) << "relu input from split " << index << ": " << op->input(0);
+        i++;
+      }
+    }
+    VLOG(2) << "Pass Detection.";
+    return true;
+  }
+
+  Status AdvanceTails(const ChainLinkSet& tails, ChainLinkSet* new_tails,
+                      bool* stop) const {
+    *stop = true;
+    new_tails->clear();
+    for (const auto& link : tails) {
+      const NodeDef* tail = link.node;
+      if (tail->input_size() == 0 || IsControlInput(tail->input(0))) {
+        return Status::OK();
+      }
+      NodeDef* new_tail;
+      TF_RETURN_IF_ERROR(GetInputNode(tail->input(0), &new_tail));
+      // Remember original port.
+      new_tails->insert(ChainLink(new_tail, link.port_origin));
+    }
+    *stop = false;
+    return Status::OK();
+  }
+
+  Status HoistChainForConcat(const int prefix_length, const ChainLinkSet& tails,
+                             NodeDef* concat_node) {
+    VLOG(2) << "HoistChainForConcat Entering.";
+    const string& concat_name = concat_node->name();
+    const int first_input = concat_node->op() == "Concat" ? 1 : 0;
+    // reshape to origin output of concat
+    auto out_nodes = ctx().node_map->GetOutputs(concat_node->name());
+    NodeDef* new_reshape_shape0 = ctx().optimized_graph->add_node();
+    new_reshape_shape0->set_name(AddPrefixToNodeName("origin_reshape/shape", concat_node->name()));
+    new_reshape_shape0->set_op("Const");
+    new_reshape_shape0->set_device(concat_node->device());
+    TensorProto tensor0;
+    tensor0.set_dtype(DT_INT32);
+    tensor0.mutable_tensor_shape()->add_dim()->set_size(2);
+    tensor0.add_int_val(16);
+    tensor0.add_int_val(512);
+    auto attr0 = new_reshape_shape0->mutable_attr();
+    SetAttrValue(DT_INT32, &(*attr0)["dtype"]);
+    SetAttrValue(tensor0, &(*attr0)["value"]);
+    ctx().node_map->AddNode(new_reshape_shape0->name(), new_reshape_shape0);
+
+    NodeDef* new_reshape0 = ctx().optimized_graph->add_node();
+    new_reshape0->set_name(AddPrefixToNodeName("origin_reshape", concat_node->name()));
+    new_reshape0->set_op("Reshape");
+    new_reshape0->set_device(concat_node->device());
+    new_reshape0->add_input(concat_node->name());
+    new_reshape0->add_input(new_reshape_shape0->name());
+    attr0 = new_reshape0->mutable_attr();
+    SetAttrValue(concat_node->attr().at("T").type(), &(*attr0)["T"]);
+    SetAttrValue(DT_INT32, &(*attr0)["Tshape"]);
+    ctx().node_map->AddNode(new_reshape0->name(), new_reshape0);
+    ctx().node_map->AddOutput(concat_node->name(), new_reshape0->name());
+    ctx().node_map->AddOutput(new_reshape_shape0->name(), new_reshape0->name());
+    
+    for (auto out : out_nodes) {
+      for (int port = 0; port < out->input_size(); port++) {
+        if (out->input(port) == concat_node->name()) {
+          out->set_input(port, new_reshape0->name());
+          ctx().node_map->UpdateInput(out->name(), concat_node->name(), new_reshape0->name());
+        }
+      }
+    }
+    
+
+    for (const auto& link : tails) {
+      NodeDef* tail = CHECK_NOTNULL(link.node);
+      const int concat_port = link.port_origin;
+      CHECK_GE(concat_port, 0);
+      CHECK_LT(concat_port, concat_node->input_size());
+      const string concat_input = concat_node->input(concat_port);
+      // Hook the node following tail directly into the concat node.
+      const string tail_input = tail->input(0);
+      concat_node->set_input(concat_port, tail_input);
+      ctx().node_map->UpdateInput(concat_name, concat_input, tail_input);
+
+      if (concat_port == first_input) {
+        // Update the consumers of concat to consume the end of the chain
+        // instead.
+        UpdateConsumers(concat_node, concat_input);
+        // Reuse nodes in the first chain to process output of concat.
+        tail->set_input(0, concat_name);
+        ctx().node_map->UpdateInput(tail->name(), tail_input, concat_name);
+      }
+    }
+    // add Reshape between Concat and MatMul
+    NodeDef* new_reshape_shape = ctx().optimized_graph->add_node();
+    new_reshape_shape->set_name(AddPrefixToNodeName("reshape/shape", concat_node->name()));
+    new_reshape_shape->set_op("Const");
+    new_reshape_shape->set_device(concat_node->device());
+    TensorProto tensor;
+    tensor.set_dtype(DT_INT32);
+    tensor.mutable_tensor_shape()->add_dim()->set_size(3);
+    tensor.add_int_val(16);
+    tensor.add_int_val(4);
+    tensor.add_int_val(454);
+    auto attr = new_reshape_shape->mutable_attr();
+    SetAttrValue(DT_INT32, &(*attr)["dtype"]);
+    SetAttrValue(tensor, &(*attr)["value"]);
+    ctx().node_map->AddNode(new_reshape_shape->name(), new_reshape_shape);
+
+    NodeDef* new_reshape = ctx().optimized_graph->add_node();
+    new_reshape->set_name(AddPrefixToNodeName("reshape", concat_node->name()));
+    new_reshape->set_op("Reshape");
+    new_reshape->set_device(concat_node->device());
+    new_reshape->add_input(concat_node->name());
+    new_reshape->add_input(new_reshape_shape->name());
+    attr = new_reshape->mutable_attr();
+    SetAttrValue(concat_node->attr().at("T").type(), &(*attr)["T"]);
+    SetAttrValue(DT_INT32, &(*attr)["Tshape"]);
+    ctx().node_map->AddNode(new_reshape->name(), new_reshape);
+    ctx().node_map->AddOutput(concat_node->name(), new_reshape->name());
+    ctx().node_map->AddOutput(new_reshape_shape->name(), new_reshape->name());
+
+    std::set<NodeDef*> outputs = ctx().node_map->GetOutputs(concat_node->name());
+    for (NodeDef *output : outputs) {
+      VLOG(2) << concat_node->name() << "'s output: " << output->name();
+      if ((int)(output->name().find("MatMul_1")) >= 0) {
+        // output->set_op("BatchMatMulV2");
+        for (int port = 0; port < output->input_size(); port++) {
+          if (output->input(port) == concat_node->name()) {
+            output->set_input(port, new_reshape->name());
+            break;
+          }
+        }
+        ctx().node_map->UpdateInput(output->name(), concat_node->name(), new_reshape->name());
+      }
+    }
+
+    VLOG(2) << "HoistChainForConcat Success.";
+    return Status::OK();
+  }
+
+  // Update consumers of node to take new_input as input instead.
+  void UpdateConsumers(NodeDef* node, const string& new_input) {
+    const string& node_name = node->name();
+    const std::set<NodeDef*> consumers = ctx().node_map->GetOutputs(node_name);
+    for (NodeDef* consumer : consumers) {
+      for (int i = 0; i < consumer->input_size(); ++i) {
+        if (consumer->input(i) == node_name) {
+          consumer->set_input(i, new_input);
+          ctx().node_map->UpdateInput(consumer->name(), node_name, new_input);
+        }
+      }
+      AddToOptimizationQueue(consumer);
+    }
+  }
+
+  bool IsAlreadyOptimized(const NodeDef& node) const {
+    return optimized_nodes_.find(node.name()) != optimized_nodes_.end();
+  }
+
+ private:
+  std::unordered_set<string> optimized_nodes_;
+};
 // This optimization hoists the common prefix of unary ops of the inputs to
 // concat out of the concat, for example:
 //    Concat([Exp(Sin(x)), Exp(Sin(y)), Exp(Sin(z))])
@@ -1400,7 +1895,7 @@ class HoistCWiseUnaryChainsStage : public ArithmeticOptimizerStage {
  public:
   explicit HoistCWiseUnaryChainsStage(const GraphOptimizerContext& ctx,
                                       const ArithmeticOptimizerContext& ctx_ext)
-      : ArithmeticOptimizerStage("", ctx, ctx_ext) {}
+      : ArithmeticOptimizerStage("HoistCWiseUnaryChainsStage", ctx, ctx_ext) {}
 
   ~HoistCWiseUnaryChainsStage() override = default;
 
@@ -3523,6 +4018,11 @@ void ArithmeticOptimizer::DedupComputations() {
 
   // Delete duplicates
   if (fetch_nodes_known_ && !duplicates.empty()) {
+    for (auto _node_id : duplicates) {
+      auto &_node = optimized_graph_->node(_node_id);
+      string node_name = _node.name();
+      VLOG(2) << "Deleting node: " << node_name;
+    }
     EraseNodesFromGraph(duplicates, optimized_graph_);
     // Rebuild the NodeMap which was invalidated by the node  swapping above.
     node_map_.reset(new NodeMap(optimized_graph_));
@@ -3578,6 +4078,8 @@ Status ArithmeticOptimizer::SimplifyArithmeticOps(bool can_use_shapes) {
     pipeline.AddStage<ReorderCastLikeAndValuePreserving>(ctx, ctx_ext);
   if (options_.simplify_aggregation)
     pipeline.AddStage<SimplifyAggregation>(ctx, ctx_ext);
+  if (options_.hoist_concat_chains)
+    pipeline.AddStage<HoistConcatChainsStage>(ctx, ctx_ext);
   if (options_.hoist_cwise_unary_chains)
     pipeline.AddStage<HoistCWiseUnaryChainsStage>(ctx, ctx_ext);
   if (options_.convert_sqrt_div_to_rsqrt_mul)
@@ -3693,6 +4195,22 @@ Status ArithmeticOptimizer::Optimize(Cluster* /*cluster*/,
   TF_RETURN_IF_ERROR(SimplifyArithmeticOps(can_use_shapes));
 
   optimized_graph->Swap(optimized_graph_);
+  VLOG(2) << "Original Graph: ";
+  for(auto &node : item.graph.node()) {
+    VLOG(2) << node.name();
+    VLOG(2) << "  op:" << node.op();
+    for(auto &input : node.input()) {
+      VLOG(2) << "  input:" << input;
+    }
+  }
+  VLOG(2) << "Optimized Graph:";
+  for(auto &node : optimized_graph->node()) {
+    VLOG(2) << node.name();
+    VLOG(2) << "  op:" << node.op();
+    for(auto &input : node.input()) {
+      VLOG(2) << "  input:" << input;
+    }
+  }
   return Status::OK();
 }
 

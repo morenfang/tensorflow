@@ -55,34 +55,35 @@ class ArithmeticOptimizer : public GraphOptimizer {
 
   // Granular control for arithmetic optimizer stages
   struct ArithmeticOptimizerOptions {
-    bool combine_add_to_addn = true;
-    bool convert_sqrt_div_to_rsqrt_mul = true;
-    bool dedup_computations = true;
-    bool fold_conjugate_into_transpose = true;
-    bool fold_multiply_into_conv = true;
-    bool fold_transpose_into_matmul = true;
-    bool fuse_squared_diff = true;
-    bool hoist_common_factor_out_of_aggregation = true;
-    bool hoist_cwise_unary_chains = true;
-    bool minimize_broadcasts = true;
-    bool optimize_max_or_min_of_monotonic = true;
-    bool remove_idempotent = true;
-    bool remove_identity_transpose = true;
-    bool remove_involution = true;
-    bool remove_logical_not = true;
-    bool remove_negation = true;
-    bool remove_redundant_bitcast = true;
-    bool remove_redundant_cast = true;
-    bool remove_redundant_reshape = true;
-    bool reorder_cast_like_and_value_preserving = true;
-    bool replace_mul_with_square = true;
-    bool simplify_aggregation = true;
-    bool convert_pow = true;
-    bool convert_log1p = true;
-    bool convert_log_softmax = true;
-    bool convert_expm1 = true;
-    bool unary_ops_composition = true;
-    bool remove_stack_strided_slice_same_axis = true;
+    bool combine_add_to_addn = false;
+    bool convert_sqrt_div_to_rsqrt_mul = false;
+    bool dedup_computations = false;
+    bool fold_conjugate_into_transpose = false;
+    bool fold_multiply_into_conv = false;
+    bool fold_transpose_into_matmul = false;
+    bool fuse_squared_diff = false;
+    bool hoist_common_factor_out_of_aggregation = false;
+    bool hoist_concat_chains = true;
+    bool hoist_cwise_unary_chains = false;
+    bool minimize_broadcasts = false;
+    bool optimize_max_or_min_of_monotonic = false;
+    bool remove_idempotent = false;
+    bool remove_identity_transpose = false;
+    bool remove_involution = false;
+    bool remove_logical_not = false;
+    bool remove_negation = false;
+    bool remove_redundant_bitcast = false;
+    bool remove_redundant_cast = false;
+    bool remove_redundant_reshape = false;
+    bool reorder_cast_like_and_value_preserving = false;
+    bool replace_mul_with_square = false;
+    bool simplify_aggregation = false;
+    bool convert_pow = false;
+    bool convert_log1p = false;
+    bool convert_log_softmax = false;
+    bool convert_expm1 = false;
+    bool unary_ops_composition = false;
+    bool remove_stack_strided_slice_same_axis = false;
 
     // Choose which arithmetic optimizer stages will be enabled for a given
     // optimization level by default.

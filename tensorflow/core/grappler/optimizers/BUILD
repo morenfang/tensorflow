@@ -597,6 +597,7 @@ cc_library(
         ":remapper",
         ":scoped_allocator_optimizer",
         ":shape_optimizer",
+        ":concat_optimizer",
         "//tensorflow/core:core_cpu_base",
         "//tensorflow/core:framework",
         "//tensorflow/core:lib",
@@ -999,6 +1000,41 @@ cc_library(
         "//tensorflow/core/grappler/utils:symbolic_shapes",
         "//tensorflow/core/grappler/utils:topological_sort",
         "//tensorflow/core/grappler/utils:tpu",
+    ],
+)
+
+cc_library(
+    name = "concat_optimizer",
+    srcs = ["concat_optimizer.cc"],
+    hdrs = [
+        "concat_optimizer.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":custom_graph_optimizer",
+        "//tensorflow/core:lib",
+        "//tensorflow/core:protos_all_cc",
+        "//tensorflow/core:framework",
+        "//tensorflow/core/grappler:graph_view",
+        "//tensorflow/core/grappler:grappler_item",
+        "//tensorflow/core/grappler:op_types",
+        "//tensorflow/core/grappler:utils",
+        "//tensorflow/core/grappler/costs:graph_properties",
+        "//tensorflow/core/grappler/utils:frame",
+        "//tensorflow/core/grappler/utils:symbolic_shapes",
+        "//tensorflow/core/grappler/utils:topological_sort",
+    ]
+)
+
+tf_cuda_cc_test(
+    name = "concat_optimizer_test",
+    size = "small",
+    srcs = ["concat_optimizer_test.cc"],
+    deps = [
+        ":concat_optimizer",
+        "//tensorflow/core:lib",
+        "//tensorflow/core:test",
+        "//tensorflow/core:test_main",
     ],
 )
 

@@ -41,6 +41,7 @@ limitations under the License.
 #include "tensorflow/core/grappler/optimizers/remapper.h"
 #include "tensorflow/core/grappler/optimizers/scoped_allocator_optimizer.h"
 #include "tensorflow/core/grappler/optimizers/shape_optimizer.h"
+#include "tensorflow/core/grappler/optimizers/concat_optimizer.h"
 #include "tensorflow/core/grappler/utils/canonicalizer.h"
 #include "tensorflow/core/grappler/utils/colocation.h"
 #include "tensorflow/core/grappler/utils/functions.h"
@@ -218,6 +219,7 @@ Status MetaOptimizer::InitializeOptimizers(
     optimizers->push_back(MakeUnique<ScopedAllocatorOptimizer>(
         cfg_.scoped_allocator_optimization(), cfg_.scoped_allocator_opts()));
   }
+  optimizers->push_back(MakeUnique<ConcatOptimizer>());
   return InitializeCustomGraphOptimizers(std::set<string>(), optimizers);
 }
 
@@ -252,12 +254,13 @@ Status MetaOptimizer::InitializeOptimizersByName(
 Status MetaOptimizer::InitializeCustomGraphOptimizers(
     const std::set<string>& pre_initialized_optimizers,
     std::vector<std::unique_ptr<GraphOptimizer>>* optimizers) const {
+  VLOG(2) << "Init Custom Opt " << cfg_.custom_optimizers().size();
   for (const auto& optimizer_config : cfg_.custom_optimizers()) {
     if (pre_initialized_optimizers.find(optimizer_config.name()) !=
         pre_initialized_optimizers.end()) {
       continue;
     }
-
+    VLOG(2) << "Custom optimizer initialize: " << optimizer_config.name();
     auto custom_optimizer = CustomGraphOptimizerRegistry::CreateByNameOrNull(
         optimizer_config.name());
 
@@ -401,7 +404,14 @@ Status MetaOptimizer::OptimizeGraph(Cluster* cluster, const GrapplerItem& item,
 
       TF_RETURN_IF_ERROR(RunOptimizer(optimizer.get(), cluster, &optimized_item,
                                       optimized_graph, &optimization_result));
-
+      VLOG(2) << optimizer->name() << ": Optimized Graph:";
+      for(auto &node : optimized_graph->node()) {
+        VLOG(2) << node.name();
+        VLOG(2) << "  op:" << node.op();
+        for(auto &input : node.input()) {
+          VLOG(2) << "  input:" << input;
+        }
+      }
       if (iteration == 0 && optimizer->name() == "model_pruner") {
         CompressConstants(optimized_graph);
       }
